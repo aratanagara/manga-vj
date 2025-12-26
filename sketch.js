@@ -1,256 +1,397 @@
-// sketch.js
-// p5.js (WEBGL) + custom shader (shader.vert / shader.frag)
-
-const MAX_PANELS = 16;
+// sketch.js  (見開き対応版)
+// shader.vert / shader.frag は「前の（気に入ってる）やつ」をそのまま使ってOK
 
 let sh;
-let panels = [];
-let lastCycleIndex = -1;
+let maskG;
 
-function preload(){
+let panels = [];   // {x,y,w,h, id01, tone01, startTime, duration, effect, dir, slidePx, popScale}
+let lastResetSec = -999;
+const RESET_EVERY = 5.0;
+
+// ===== 調整したい値（今のトンマナを維持） =====
+let gutterX = 12;        // コマ間の横余白(px)
+let gutterY = 24;        // コマ間の縦余白(px)
+let innerMarginX = 48;   // ページ内枠（表示しない／断ち切り判定用）左右(px)
+let innerMarginY = 48;   // ページ内枠（表示しない／断ち切り判定用）天地(px)
+let borderPx = 4.0;      // コマ枠の太さ(px)
+
+// 見開き中央（ノド）の余白(px)
+let spreadGapPx = 42;
+
+
+// 横長判定（これ以上で見開き）
+let spreadAspect = 1.15;
+
+function preload() {
   sh = loadShader("shader.vert", "shader.frag");
 }
 
-function setup(){
-  pixelDensity(1);
+function setup() {
   createCanvas(windowWidth, windowHeight, WEBGL);
-  noStroke();
+  pixelDensity(1);
 
-  // 初期レイアウト
-  rebuildLayout(0);
+  maskG = createGraphics(width, height);
+  maskG.pixelDensity(1);
+
+  resetLayout();
 }
 
-function windowResized(){
+function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
+  pixelDensity(1);
+
+  maskG = createGraphics(width, height);
+  maskG.pixelDensity(1);
+
+  resetLayout();
 }
 
-function draw(){
+function draw() {
   const t = millis() * 0.001;
 
-  // 周期でレイアウト更新（同時にコマ割りが出現→保持→消失）
-  const cycleLen = 7.0;
-  const cycleIndex = Math.floor(t / cycleLen);
-  const cycleT = t - cycleIndex * cycleLen;
-
-  if (cycleIndex !== lastCycleIndex){
-    lastCycleIndex = cycleIndex;
-    rebuildLayout(t);
+  // 5秒ごとにリセット
+  const k = floor(t / RESET_EVERY);
+  if (k !== lastResetSec) {
+    lastResetSec = k;
+    resetLayout();
   }
 
-  shader(sh);
+  // マスク更新
+  maskG.clear();       // alpha=0
+  maskG.noStroke();
 
-  // uniforms
+  for (let i = 0; i < panels.length; i++) {
+    const p = panels[i];
+    const tt = (t - p.startTime);
+    const a = clamp01(easeOutQuintBound(tt / p.duration));
+
+    // slide/pop はフェードセット（alpha=a）
+    const e = applyEffect(p, a);
+
+    // R: panelId, G: toneSeed, A: alpha
+    const r = Math.floor(clamp01(p.id01) * 255);
+    const g = Math.floor(clamp01(p.tone01) * 255);
+    const aa = Math.floor(clamp01(e.alpha) * 255);
+
+    maskG.fill(r, g, 0, aa);
+    maskG.rect(e.x, e.y, e.w, e.h);
+  }
+
+  // シェーダ合成
+  shader(sh);
   sh.setUniform("uResolution", [width, height]);
   sh.setUniform("uTime", t);
-  sh.setUniform("uCycleT", cycleT);
-  sh.setUniform("uCycleLen", cycleLen);
-
-  const borderPx = Math.max(4.0, Math.min(width, height) * 0.010);  // 均一枠
-  const gutterPx = Math.max(8.0, Math.min(width, height) * 0.018);  // 均一余白（斜め無し）
+  sh.setUniform("uMask", maskG);
   sh.setUniform("uBorderPx", borderPx);
-  sh.setUniform("uGutterPx", gutterPx);
 
-  const n = Math.min(panels.length, MAX_PANELS);
-  sh.setUniform("uPanelCount", n);
-
-  // pack arrays
-  const rects = new Array(MAX_PANELS * 4).fill(0);
-  const anims = new Array(MAX_PANELS * 4).fill(0);
-  const styles = new Array(MAX_PANELS * 4).fill(0);
-
-  for (let i = 0; i < n; i++){
-    const p = panels[i];
-
-    rects[i*4+0] = p.x;
-    rects[i*4+1] = p.y;
-    rects[i*4+2] = p.w;
-    rects[i*4+3] = p.h;
-
-    anims[i*4+0] = p.t0;
-    anims[i*4+1] = p.dur;
-    anims[i*4+2] = p.fx;   // 0 popup / 1 slide / 2 fade
-    anims[i*4+3] = p.seed;
-
-    styles[i*4+0] = p.tone;  // 0 dots / 1 lines / 2 black / 3 noise
-    styles[i*4+1] = p.toneS;
-    styles[i*4+2] = p.ink;   // 0..1
-    styles[i*4+3] = p.cut;   // 0/1 (断ち切り)
-  }
-
-  sh.setUniform("uRects", rects);
-  sh.setUniform("uAnims", anims);
-  sh.setUniform("uStyles", styles);
-
-  // fullscreen quad
-  rect(-width/2, -height/2, width, height);
+  // 全面
+  noStroke();
+  rectMode(CENTER);
+  rect(0, 0, width, height);
 }
 
-function rebuildLayout(globalT){
-  // コマ割り：1-3列、1-4行、右→左、上→下で充填
-  const cols = 1 + Math.floor(Math.random() * 3);
-  const rows = 1 + Math.floor(Math.random() * 4);
+// =========================
+// 見開きページ領域を作る
+// =========================
+function getPageRects() {
+  const isSpread = (width / max(1, height)) >= spreadAspect;
 
-  const borderPx = Math.max(4.0, Math.min(windowWidth, windowHeight) * 0.010);
-  const gutterPx = Math.max(8.0, Math.min(windowWidth, windowHeight) * 0.018);
+  if (!isSpread) {
+    return [{
+      x0: 0, y0: 0, x1: width, y1: height,
+      pageIndex: 0,
+      isSpread: false
+    }];
+  }
 
-  // バラバラ幅（ただし合計で画面を充填）
-  const colW = randWeights(cols, 0.6, 1.6);
-  const rowH = randWeights(rows, 0.7, 1.7);
+  // 見開き：左右2ページ + ノド(中央gap)
+  const gap = spreadGapPx;
 
-  // グリッド占有
-  const occ = Array.from({length: rows}, () => Array(cols).fill(-1));
-  const rects = [];
+  // 左右ページに均等割り
+  const pageW = (width - gap) * 0.5;
+  const pageH = height;
 
-  // 走査順：右→左、上→下
-  let id = 0;
-  for (let r = 0; r < rows; r++){
-    for (let c = cols - 1; c >= 0; c--){
-      if (occ[r][c] !== -1) continue;
+  const left = {
+    x0: 0,
+    y0: 0,
+    x1: pageW,
+    y1: pageH,
+    pageIndex: 0,
+    isSpread: true
+  };
+  const right = {
+    x0: pageW + gap,
+    y0: 0,
+    x1: pageW + gap + pageW,
+    y1: pageH,
+    pageIndex: 1,
+    isSpread: true
+  };
 
-      // スパン選択（日本漫画っぽく大小を混ぜる）
-      const maxC = cols - c;
-      const maxR = rows - r;
+  return [left, right];
+}
 
-      const spanC = pickSpan(maxC, 0.55);
-      const spanR = pickSpan(maxR, 0.60);
+// =========================
+// レイアウト生成（ページごとに同じトンマナ）
+// =========================
+function resetLayout() {
+  const t = millis() * 0.001;
+  panels = [];
 
-      // 置ける最大に調整（重なり禁止）
-      let sc = spanC, sr = spanR;
-      while (!canPlace(occ, r, c, sr, sc)){
-        if (sc > 1) sc--;
-        else if (sr > 1) sr--;
-        else break;
+  const pages = getPageRects();
+
+  for (const page of pages) {
+    // ページ内枠（表示しない）…断ち切り/非断ち切りの差の基準
+    const pageX0 = page.x0, pageY0 = page.y0, pageX1 = page.x1, pageY1 = page.y1;
+    const innerX0 = pageX0 + innerMarginX;
+    const innerY0 = pageY0 + innerMarginY;
+    const innerX1 = pageX1 - innerMarginX;
+    const innerY1 = pageY1 - innerMarginY;
+
+    // 内枠が潰れると破綻するのでガード
+    if (innerX1 <= innerX0 + 20 || innerY1 <= innerY0 + 20) continue;
+
+    // 1-3列、1-4行
+    const cols = 1 + floor(random(3));
+    const rows = 1 + floor(random(4));
+
+    // ベースは内枠を“完全充填”
+    const W = (innerX1 - innerX0);
+    const H = (innerY1 - innerY0);
+
+    const usableW = max(10, W - gutterX * (cols - 1));
+    const usableH = max(10, H - gutterY * (rows - 1));
+
+    const colW = randParts(cols, usableW, 0.75);
+    const rowH = randParts(rows, usableH, 0.75);
+
+    // 右→左のx（ページ内で）
+    const xs = [];
+    {
+      let x = innerX1;
+      for (let c = 0; c < cols; c++) {
+        const w = colW[c];
+        x -= w;
+        xs.push(x);
+        x -= gutterX;
+      }
+    }
+
+    // 上→下のy
+    const ys = [];
+    {
+      let y = innerY0;
+      for (let r = 0; r < rows; r++) {
+        ys.push(y);
+        y += rowH[r] + gutterY;
+      }
+    }
+
+    // セル作成
+    let cells = [];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        cells.push({
+          r, c,
+          x: xs[c],
+          y: ys[r],
+          w: colW[c],
+          h: rowH[r],
+          used: false
+        });
+      }
+    }
+
+    // 右→左、上→下で走査（読順）
+    cells.sort((a, b) => (a.r - b.r) || (b.c - a.c));
+    const pickCell = (r, c) => cells.find(v => v.r === r && v.c === c);
+
+    // ランダムに連結して変化
+    let merged = [];
+    for (const cell of cells) {
+      if (cell.used) continue;
+
+      const canMergeLeft = (cell.c + 1 < cols) && !pickCell(cell.r, cell.c + 1).used;
+      const canMergeDown = (cell.r + 1 < rows) && !pickCell(cell.r + 1, cell.c).used;
+
+      let mergeDir = null;
+      if ((canMergeLeft || canMergeDown) && random() < 0.45) {
+        if (canMergeLeft && canMergeDown) mergeDir = (random() < 0.55) ? "down" : "left";
+        else mergeDir = canMergeDown ? "down" : "left";
       }
 
-      mark(occ, r, c, sr, sc, id);
-      rects.push({r, c, sr, sc, id});
-      id++;
-      if (id >= MAX_PANELS) break;
+      if (!mergeDir) {
+        cell.used = true;
+        merged.push({ x: cell.x, y: cell.y, w: cell.w, h: cell.h, tag: cornerTag(cell, rows, cols) });
+        continue;
+      }
+
+      if (mergeDir === "left") {
+        const other = pickCell(cell.r, cell.c + 1);
+        cell.used = true;
+        other.used = true;
+        merged.push({
+          x: cell.x,
+          y: cell.y,
+          w: cell.w + gutterX + other.w,
+          h: cell.h,
+          tag: cornerTag(cell, rows, cols)
+        });
+      } else {
+        const other = pickCell(cell.r + 1, cell.c);
+        cell.used = true;
+        other.used = true;
+        merged.push({
+          x: cell.x,
+          y: cell.y,
+          w: cell.w,
+          h: cell.h + gutterY + other.h,
+          tag: cornerTag(cell, rows, cols)
+        });
+      }
     }
-    if (id >= MAX_PANELS) break;
+
+    // パネル化（断ち切りは四隅中心に確率）
+    for (let i = 0; i < merged.length; i++) {
+      const m = merged[i];
+
+      const baseBleed = 0.10;
+      const cornerBoost = (m.tag === "corner") ? 0.35 : (m.tag === "edge" ? 0.12 : 0.0);
+      const doBleed = random() < (baseBleed + cornerBoost);
+
+      let x = m.x, y = m.y, w = m.w, h = m.h;
+
+      if (doBleed) {
+        // 内枠をはみ出して“ページ端”へ（ページ外には出さない）
+        const cx = x + w * 0.5;
+        const cy = y + h * 0.5;
+
+        // 左右
+        if (cx > (pageX0 + pageX1) * 0.5) {
+          // 右寄り -> 右端へ
+          w = min(pageX1 - x, w + (innerX1 - (x + w)));
+        } else {
+          // 左寄り -> 左端へ
+          const newX = pageX0;
+          w = (x + w) - newX;
+          x = newX;
+        }
+
+        // 上下
+        if (cy < (pageY0 + pageY1) * 0.5) {
+          // 上寄り -> 上端へ
+          const newY = pageY0;
+          h = (y + h) - newY;
+          y = newY;
+        } else {
+          // 下寄り -> 下端へ
+          h = min(pageY1 - y, h + (innerY1 + innerMarginY - (y + h)));
+        }
+      }
+
+      // 演出：slide / pop / fade
+      // ※「slide/pop は fade とセット」→ alpha は必ず a を使う（applyEffect側）
+      const roll = random();
+      let effect = "fade";
+      if (roll < 0.34) effect = "slide";
+      else if (roll < 0.68) effect = "pop";
+
+      const dir = random(["L", "R", "U", "D"]);
+
+      // IDはページ跨ぎでも被らないように割り当て（枠線の誤検出防止）
+      // 0..1 に安全に収める
+      const id01 = ((page.pageIndex * 32 + i + 1) / 256.0);
+
+      panels.push({
+        x, y, w, h,
+        id01,
+        tone01: random(), // トーン密度/種類の種
+
+        startTime: t + random(0.02, 0.40),
+        duration: random(0.55, 1.10),
+
+        effect,
+        dir,
+        slidePx: random(40, 160),
+        popScale: random(0.78, 0.92)
+      });
+    }
   }
-
-  // 実ピクセル位置（余白を意味なく作らず、全面充填）
-  const usableW = Math.max(16, windowWidth  - (cols + 1) * gutterPx);
-  const usableH = Math.max(16, windowHeight - (rows + 1) * gutterPx);
-
-  const colPx = colW.map(w => w * usableW);
-  const rowPx = rowH.map(h => h * usableH);
-
-  const x0 = [];
-  const y0 = [];
-  let x = 0;
-  for (let i = 0; i < cols; i++){
-    x += gutterPx;
-    x0[i] = x;
-    x += colPx[i];
-  }
-  let y = 0;
-  for (let j = 0; j < rows; j++){
-    y += gutterPx;
-    y0[j] = y;
-    y += rowPx[j];
-  }
-
-  // 断ち切り（四隅中心に確率で）
-  const cornerProb = 0.45;
-
-  panels = rects.map((g, idx) => {
-    let rx = x0[g.c];
-    let ry = y0[g.r];
-
-    let rw = 0;
-    for (let cc = 0; cc < g.sc; cc++){
-      rw += colPx[g.c + cc];
-      if (cc > 0) rw += gutterPx;
-    }
-    let rh = 0;
-    for (let rr = 0; rr < g.sr; rr++){
-      rh += rowPx[g.r + rr];
-      if (rr > 0) rh += gutterPx;
-    }
-
-    // 右上/左上/右下/左下のどれかに触れていれば断ち切り候補
-    const touchesLeft   = (g.c === 0);
-    const touchesRight  = (g.c + g.sc === cols);
-    const touchesTop    = (g.r === 0);
-    const touchesBottom = (g.r + g.sr === rows);
-
-    let cut = 0;
-    if ((touchesTop && touchesRight) || (touchesTop && touchesLeft) ||
-        (touchesBottom && touchesRight) || (touchesBottom && touchesLeft)){
-      if (Math.random() < cornerProb) cut = 1;
-    } else {
-      // 角以外も少しだけ
-      if (Math.random() < 0.12) cut = 1;
-    }
-
-    if (cut){
-      if (touchesLeft)  rx = 0;
-      if (touchesTop)   ry = 0;
-      if (touchesRight) rw = windowWidth - rx;
-      if (touchesBottom)rh = windowHeight - ry;
-    }
-
-    // アニメ（同時出現っぽく：t0は近接させる）
-    const fx = (Math.random() < 0.40) ? 0 : (Math.random() < 0.70 ? 1 : 2); // popup/slide/fade
-    const t0 = globalT + (Math.random() * 0.18);
-    const dur = 1.05 + Math.random() * 0.35;
-
-    // トーン/ベタ（必ず入る）
-    const tonePick = Math.random();
-    let tone = 0;
-    if (tonePick < 0.46) tone = 0;        // dots
-    else if (tonePick < 0.78) tone = 1;   // lines
-    else if (tonePick < 0.92) tone = 3;   // noise
-    else tone = 2;                        // black
-
-    const seed = Math.random() * 10000.0;
-    const ink = 0.70 + Math.random() * 0.30;
-    const toneS = 0.8 + Math.random() * 1.8;
-
-    return {
-      x: rx, y: ry, w: rw, h: rh,
-      t0, dur, fx, seed,
-      tone, toneS, ink,
-      cut
-    };
-  });
 }
 
-function randWeights(n, lo, hi){
-  const a = [];
-  for (let i = 0; i < n; i++){
-    a.push(lo + Math.random() * (hi - lo));
+// =========================
+// エフェクト（Quint+Bound）
+// slide/pop は fade とセット（alpha=a を必ず返す）
+// =========================
+function applyEffect(p, a01) {
+  const a = clamp01(a01);
+
+  let x = p.x, y = p.y, w = p.w, h = p.h;
+  let alpha = a; // ←セット
+
+  if (p.effect === "slide") {
+    let dx = 0, dy = 0;
+    if (p.dir === "L") dx = -p.slidePx * (1.0 - a);
+    if (p.dir === "R") dx =  p.slidePx * (1.0 - a);
+    if (p.dir === "U") dy = -p.slidePx * (1.0 - a);
+    if (p.dir === "D") dy =  p.slidePx * (1.0 - a);
+    x += dx; y += dy;
+  } else if (p.effect === "pop") {
+    const s = lerp(p.popScale, 1.0, a);
+    const cx = x + w * 0.5;
+    const cy = y + h * 0.5;
+    w *= s; h *= s;
+    x = cx - w * 0.5;
+    y = cy - h * 0.5;
+  } else {
+    // fade only
   }
-  const s = a.reduce((p,c)=>p+c, 0);
-  return a.map(v => v / s);
+
+  return { x, y, w, h, alpha };
 }
 
-function pickSpan(maxSpan, biasSmall){
-  if (maxSpan <= 1) return 1;
-  const r = Math.random();
-  if (r < biasSmall) return 1;
-  if (maxSpan >= 3 && r < biasSmall + 0.30) return 2;
-  return Math.min(maxSpan, 3 + Math.floor(Math.random() * Math.min(2, maxSpan - 2)));
+function easeOutQuintBound(x) {
+  const t = clamp01(x);
+  const q = 1.0 - pow(1.0 - t, 5.0);
+  const b = 1.0 + 0.10 * sin(q * PI * 1.5) * (1.0 - q);
+  return clamp01(q * b);
 }
 
-function canPlace(occ, r, c, sr, sc){
-  const rows = occ.length;
-  const cols = occ[0].length;
-  if (r + sr > rows || c + sc > cols) return false;
-  for (let y = r; y < r + sr; y++){
-    for (let x = c; x < c + sc; x++){
-      if (occ[y][x] !== -1) return false;
-    }
+// =========================
+// util
+// =========================
+function clamp01(v){ return max(0, min(1, v)); }
+
+function randParts(n, total, skew) {
+  let a = [];
+  let s = 0;
+  for (let i = 0; i < n; i++) {
+    const r = pow(random(0.0001, 1.0), skew);
+    a.push(r); s += r;
   }
-  return true;
+  const out = [];
+  let acc = 0;
+  for (let i = 0; i < n; i++) {
+    const v = total * (a[i] / s);
+    out.push(v);
+    acc += v;
+  }
+  out[n - 1] += (total - acc);
+  return out;
 }
 
-function mark(occ, r, c, sr, sc, id){
-  for (let y = r; y < r + sr; y++){
-    for (let x = c; x < c + sc; x++){
-      occ[y][x] = id;
-    }
-  }
+function cornerTag(cell, rows, cols) {
+  const r = cell.r, c = cell.c;
+  const isTop = (r === 0);
+  const isBottom = (r === rows - 1);
+  const isRight = (c === 0);         // 右→左配置なので c=0 が最右列
+  const isLeft = (c === cols - 1);
+
+  const isCorner = (isTop && isRight) || (isTop && isLeft) || (isBottom && isRight) || (isBottom && isLeft);
+  if (isCorner) return "corner";
+
+  const isEdge = isTop || isBottom || isRight || isLeft;
+  if (isEdge) return "edge";
+
+  return "inner";
 }
