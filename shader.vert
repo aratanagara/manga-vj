@@ -1,3 +1,4 @@
+// shader.vert
 #ifdef GL_ES
 precision mediump float;
 precision mediump int;
@@ -6,10 +7,10 @@ precision mediump int;
 attribute vec3 aPosition;
 attribute vec2 aTexCoord;
 
-varying vec2 vTexCoord;
-
 uniform mat4 uModelViewMatrix;
 uniform mat4 uProjectionMatrix;
+
+varying vec2 vTexCoord;
 
 void main(){
   vTexCoord = aTexCoord;
